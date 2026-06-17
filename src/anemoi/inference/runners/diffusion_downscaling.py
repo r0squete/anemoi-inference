@@ -112,7 +112,10 @@ class DiffusionDownscalingRunner(DownscalingRunner):
         model, which returns a **bare** ``out_hres`` tensor. Wrap it back into a
         dict so the forecast loop can route it like any multi-dataset output.
         """
-        y_pred = super().predict_step(model, input_tensors_torch, **kwargs)
+        # Model expects 5-D (batch, time, ensemble, grid, vars); input_tensors_torch
+        # is 4-D (batch, time, grid, vars) → insert the ensemble axis (size 1) here.
+        batch = {ds: t.unsqueeze(2) for ds, t in input_tensors_torch.items()}
+        y_pred = super().predict_step(model, batch, **kwargs)
         if isinstance(y_pred, torch.Tensor):
             outputs = [ds for ds in self.tensor_handlers if ds not in input_tensors_torch]
             if len(outputs) != 1:
@@ -154,13 +157,11 @@ class DiffusionDownscalingRunner(DownscalingRunner):
         with torch.inference_mode():
             self.model.eval()
 
-            # Build torch input tensors once. The D² model expects a 5-D dict batch
-            # (batch, time, ensemble, grid, vars); input_tensors_numpy[ds] is
-            # (time, vars, grid) → (1, time, 1, grid, vars).
+            # Build torch input tensors once: (time, vars, grid) → 4-D
+            # (batch, time, grid, vars). The ensemble axis is inserted per call in
+            # predict_step, keeping this 4-D form compatible with _print_input_tensor.
             input_tensors_torch: dict[str, "torch.Tensor"] = {
-                ds: torch.from_numpy(
-                    np.swapaxes(t, -2, -1)[np.newaxis, :, np.newaxis, ...]
-                ).to(self.device)
+                ds: torch.from_numpy(np.swapaxes(t, -2, -1)[np.newaxis, ...]).to(self.device)
                 for ds, t in input_tensors_numpy.items()
             }
 
