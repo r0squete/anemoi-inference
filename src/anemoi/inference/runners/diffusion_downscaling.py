@@ -65,9 +65,9 @@ class DiffusionDownscalingRunner(DownscalingRunner):
     arrays; the rest of the runner is grid-agnostic.
     """
 
-    def __init__(self, config: RunConfiguration) -> None:
+    def __init__(self, config: RunConfiguration, *, num_members: int = 1) -> None:
         super().__init__(config)
-        self.num_members: int = int(getattr(config, "num_members", 1))
+        self.num_members = num_members
         LOG.info(
             "%s: %d ensemble member(s) per timestep.",
             self.__class__.__name__,
