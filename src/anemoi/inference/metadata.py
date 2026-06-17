@@ -1444,7 +1444,9 @@ class MultiDatasetMetadata(Metadata):
     @cached_property
     def multi_step_output(self) -> int:
         """Number of future steps predicted by single model forward."""
-        return len(self._inference.timesteps.output_relative_date_indices)
+        v = self._inference.timesteps.output_relative_date_indices
+        # Older checkpoints store this as a bare int rather than a list
+        return len(v) if hasattr(v, "__len__") else int(v)
 
     @cached_property
     def input_explicit_times(self) -> Any:
