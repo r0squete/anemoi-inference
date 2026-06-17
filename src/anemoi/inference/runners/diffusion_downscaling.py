@@ -98,6 +98,28 @@ class DiffusionDownscalingRunner(DownscalingRunner):
     # ------------------------------------------------------------------
     # Core inference — ensemble loop
     # ------------------------------------------------------------------
+    def predict_step(
+        self,
+        model: "torch.nn.Module",
+        input_tensors_torch: dict[str, "torch.Tensor"],
+        **kwargs,
+    ) -> dict[str, "torch.Tensor"]:
+        """Run one diffusion sample and key the result by the output dataset.
+
+        The loaded ``AnemoiModelInterface`` already injects the per-dataset
+        pre/post processors (including the residual/tendency post-processors
+        needed to de-normalise the residual prediction) and delegates to the D²
+        model, which returns a **bare** ``out_hres`` tensor. Wrap it back into a
+        dict so the forecast loop can route it like any multi-dataset output.
+        """
+        y_pred = super().predict_step(model, input_tensors_torch, **kwargs)
+        if isinstance(y_pred, torch.Tensor):
+            outputs = [ds for ds in self.tensor_handlers if ds not in input_tensors_torch]
+            if len(outputs) != 1:
+                raise ValueError(f"Expected exactly one output-only dataset, got {outputs}")
+            y_pred = {outputs[0]: y_pred}
+        return y_pred
+
 
     def forecast(
         self,
@@ -132,10 +154,13 @@ class DiffusionDownscalingRunner(DownscalingRunner):
         with torch.inference_mode():
             self.model.eval()
 
-            # Build torch input tensors once.
-            # The base Runner converts (multi_step, vars, grid) → (1, multi_step, grid, vars).
+            # Build torch input tensors once. The D² model expects a 5-D dict batch
+            # (batch, time, ensemble, grid, vars); input_tensors_numpy[ds] is
+            # (time, vars, grid) → (1, time, 1, grid, vars).
             input_tensors_torch: dict[str, "torch.Tensor"] = {
-                ds: torch.from_numpy(np.swapaxes(t, -2, -1)[np.newaxis, ...]).to(self.device)
+                ds: torch.from_numpy(
+                    np.swapaxes(t, -2, -1)[np.newaxis, :, np.newaxis, ...]
+                ).to(self.device)
                 for ds, t in input_tensors_numpy.items()
             }
 
@@ -145,8 +170,8 @@ class DiffusionDownscalingRunner(DownscalingRunner):
             LOG.info("Starting diffusion downscaling from %s", start)
 
             if self.verbosity > 0:
-                for ds, handler in self.tensor_handlers.items():
-                    handler._print_input_tensor(
+                for ds in input_tensors_torch:
+                    self.tensor_handlers[ds]._print_input_tensor(
                         f"[{ds}] Input tensor", input_tensors_torch[ds]
                     )
 
@@ -174,7 +199,8 @@ class DiffusionDownscalingRunner(DownscalingRunner):
 
                     new_states: dict[str, State] = {}
 
-                    for ds, handler in self.tensor_handlers.items():
+                    for ds in y_pred:
+                        handler = self.tensor_handlers[ds]
                         tensor = y_pred[ds]
 
                         # y_pred shape: (batch, [time], ensemble, grid, vars)

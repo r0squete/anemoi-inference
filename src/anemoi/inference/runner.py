@@ -226,6 +226,7 @@ class Runner(Context):
                 input_tensors = {
                     dataset: handler.prepare_input_tensor(input_states[dataset])
                     for dataset, handler in self.tensor_handlers.items()
+                    if input_states[dataset].get("fields")  # skip output-only datasets (e.g. diffusion target)
                 }
 
             try:
