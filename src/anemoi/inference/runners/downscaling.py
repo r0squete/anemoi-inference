@@ -17,7 +17,13 @@ class DownscalingRunner(DefaultRunner):
 
     def forecast_stepper(self, start_date, lead_time):
         dt = self.checkpoint.timestep
-        assert self.checkpoint.multi_step_output == 1, "expects multi_step_output == 1"
+        multi_step_output = self.checkpoint.multi_step_output
+        if multi_step_output != 1:
+            LOG.warning(
+                "DownscalingRunner expects multi_step_output==1, got %d. "
+                "Consider using DiffusionDownscalingRunner.",
+                multi_step_output,
+            )
         n_frames = lead_time // dt + 1  # inclusive: start .. start + lead_time
         LOG.info(
             "Downscaling %d frames, %s .. %s, no forecast offset.",
