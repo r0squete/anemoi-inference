@@ -667,6 +667,8 @@ class Runner(Context):
                 forcings_state,
             )
 
+            self._ensure_grid_coordinates(input_states[dataset], dataset)
+
             # This hook is needed for the coupled runner
             self.input_state_hook(constants_state)
 
@@ -684,6 +686,8 @@ class Runner(Context):
 
             for processor in self.post_processors[dataset]:
                 initial_states[dataset] = processor.process(initial_states[dataset])
+
+            self._ensure_grid_coordinates(initial_states[dataset], dataset)
 
         for dataset, state in initial_states.items():
             self.outputs[dataset].open(initial_states[dataset])
@@ -858,6 +862,28 @@ class Runner(Context):
             states.append(forcings_state)
 
         return self._combine_states(*states)
+
+    def _ensure_grid_coordinates(self, state: dict[str, Any], dataset: str) -> None:
+        """Backfill latitudes/longitudes from the checkpoint when missing.
+
+        Output-only datasets (e.g. a downscaling target sourced from the
+        `empty` input) carry no grid coordinates. NetCDF/GRIB outputs need
+        them, so fall back to the per-dataset coordinates stored in the
+        checkpoint supporting arrays. States that already have a grid are
+        left untouched.
+        """
+        if state.get("latitudes") is not None and state.get("longitudes") is not None:
+            return
+
+        metadata = self.tensor_handlers[dataset].metadata
+        latitudes, longitudes = metadata.latitudes, metadata.longitudes
+        if latitudes is None or longitudes is None:
+            return
+
+        LOG.info("[%s] No grid in input state; using checkpoint coordinates (%d points).",
+                dataset, len(latitudes))
+        state["latitudes"] = latitudes
+        state["longitudes"] = longitudes
 
     def _check_state(self, state: dict[str, Any], title: str) -> None:
         """Check the state for consistency.
