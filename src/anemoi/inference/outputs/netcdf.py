@@ -183,6 +183,18 @@ class NetCDFOutput(Output):
             with LOCK:
                 missing_value = self.missing_value
 
+                # A NaN _FillValue/missing_value makes CF readers (e.g. xarray with
+                # the default mask_and_scale=True) blank the ENTIRE variable on read.
+                # Use a real, out-of-range sentinel instead, so valid data reads back
+                # unmasked while genuine gaps stay detectable. Only _FillValue and
+                # missing_value are CF-standard; drop the non-standard `fill_value`.
+                if missing_value is None or (
+                    isinstance(missing_value, float) and np.isnan(missing_value)
+                ):
+                    from netCDF4 import default_fillvals
+
+                    missing_value = default_fillvals[self.float_size]
+
                 self.vars[name] = self.ncfile.createVariable(
                     name,
                     self.float_size,
@@ -192,7 +204,6 @@ class NetCDFOutput(Output):
                     **compression,
                 )
 
-                self.vars[name].fill_value = missing_value
                 self.vars[name].missing_value = missing_value
 
     def write_step(self, state: State) -> None:
