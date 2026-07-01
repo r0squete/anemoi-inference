@@ -126,6 +126,12 @@ class NetCDFOutput(Output):
         if reference_date := getattr(self.context, "reference_date", None):
             self.reference_date = reference_date
 
+        # Ensemble size comes from the runner (e.g. DiffusionDownscalingRunner).
+        # Non-ensemble runners have no `num_members`, so this falls back to 1 and
+        # the output keeps its original (time, values) layout.
+        self.num_members = getattr(self.context, "num_members", 1)
+        self.ensemble = self.num_members > 1
+
         with LOCK:
             self.values_dim = self.ncfile.createDimension("values", values)
             # unlimited time dimension avoids pre-allocation mismatches
@@ -135,6 +141,13 @@ class NetCDFOutput(Output):
             self.time_var.units = f"seconds since {self.reference_date}"
             self.time_var.long_name = "time"
             self.time_var.calendar = "gregorian"
+
+            # Ensemble members become their own fixed dimension + coordinate.
+            if self.ensemble:
+                self.ncfile.createDimension("member", self.num_members)
+                member_var = self.ncfile.createVariable("member", "i4", ("member",), **compression)
+                member_var.long_name = "ensemble member"
+                member_var[:] = np.arange(self.num_members)
 
         with LOCK:
             latitudes = state["latitudes"]
@@ -152,7 +165,9 @@ class NetCDFOutput(Output):
             self.latitude_var[:] = latitudes
             self.longitude_var[:] = longitudes
 
-        self.n = 0
+        # Map "seconds since reference_date" -> time index, so members sharing a
+        # date land on the same time slot instead of being smeared along time.
+        self._time_indices = {}
         self.vars = {}
 
     def ensure_variables(self, state: State) -> None:
@@ -175,7 +190,13 @@ class NetCDFOutput(Output):
             if name in self.vars:
                 continue
 
-            chunksizes = (1, values)
+            # Ensemble runs add a `member` axis between time and values.
+            if self.ensemble:
+                dims = ("time", "member", "values")
+                chunksizes = (1, 1, values)
+            else:
+                dims = ("time", "values")
+                chunksizes = (1, values)
 
             while np.prod(chunksizes) > 1000000:
                 chunksizes = tuple(int(np.ceil(x / 2)) for x in chunksizes)
@@ -198,7 +219,7 @@ class NetCDFOutput(Output):
                 self.vars[name] = self.ncfile.createVariable(
                     name,
                     self.float_size,
-                    ("time", "values"),
+                    dims,
                     chunksizes=chunksizes,
                     fill_value=missing_value,
                     **compression,
@@ -217,18 +238,28 @@ class NetCDFOutput(Output):
 
         self.ensure_variables(state)
 
+        # Time index is keyed by date, not a raw counter, so all members of the
+        # same valid date write into one time slot.
         step = state["date"] - self.reference_date
-        self.time_var[self.n] = step.total_seconds()
+        secs = step.total_seconds()
+        if secs not in self._time_indices:
+            self._time_indices[secs] = len(self._time_indices)
+            self.time_var[self._time_indices[secs]] = secs
+        t = self._time_indices[secs]
+
+        # States without a member key (non-ensemble runs, or the initial state)
+        # map to member 0.
+        member = state.get("member", 0)
 
         for name, value in state["fields"].items():
             if self.skip_variable(name):
                 continue
 
             with LOCK:
-                LOG.debug(f"🚧🚧🚧🚧🚧🚧 XXXXXX {name}, {self.n}, {value.shape}")
-                self.vars[name][self.n] = value
-
-        self.n += 1
+                if self.ensemble:
+                    self.vars[name][t, member] = value
+                else:
+                    self.vars[name][t] = value
 
     def close(self) -> None:
         """Close the NetCDF file."""
