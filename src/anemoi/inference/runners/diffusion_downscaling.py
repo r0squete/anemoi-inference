@@ -10,6 +10,7 @@
 import datetime
 import logging
 from collections.abc import Generator
+from contextlib import contextmanager
 
 import numpy as np
 from anemoi.utils.dates import frequency_to_timedelta as to_timedelta
@@ -18,6 +19,7 @@ from anemoi.utils.timer import Timer
 from anemoi.inference.config.run import RunConfiguration
 from anemoi.inference.lazy import torch
 from anemoi.inference.profiler import ProfilingLabel
+from anemoi.inference.tensors import TensorHandler
 from anemoi.inference.types import FloatArray
 from anemoi.inference.types import State
 
@@ -25,6 +27,9 @@ from . import runner_registry
 from .downscaling import DownscalingRunner
 
 LOG = logging.getLogger(__name__)
+
+# Logger of the tensor handlers, muted while re-sourcing frames (see `_quiet_tensor_logs`).
+TENSORS_LOG = logging.getLogger(TensorHandler.__module__)
 
 
 @runner_registry.register("diffusion_downscaling")
@@ -98,6 +103,73 @@ class DiffusionDownscalingRunner(DownscalingRunner):
     # ------------------------------------------------------------------
     # Core inference — ensemble loop
     # ------------------------------------------------------------------
+    @contextmanager
+    def _quiet_tensor_logs(self, step_index: int) -> Generator[None, None, None]:
+        """Mute the tensor handlers' INFO chatter after the first frame.
+
+        ``prepare_input_tensor`` re-emits the whole "Initial forcings
+        providers" block and the tensor shape on every call. That is
+        informative for the first frame and pure noise for the remaining
+        ``lead_time // timestep`` ones. Warnings and above still pass through,
+        and ``verbosity > 1`` keeps every message.
+
+        Parameters
+        ----------
+        step_index : int
+            Index of the frame being sourced. Frame 0 is left untouched.
+
+        Yields
+        ------
+        None
+            With :data:`TENSORS_LOG` muted for the duration of the block.
+        """
+        if step_index == 0 or self.verbosity > 1:
+            yield
+            return
+
+        previous = TENSORS_LOG.level
+        TENSORS_LOG.setLevel(max(previous, logging.WARNING))
+        try:
+            yield
+        finally:
+            TENSORS_LOG.setLevel(previous)
+
+    def _input_states_for_date(self, date: datetime.datetime) -> dict[str, State]:
+        """Build a fresh input state per dataset for ``date``.
+
+        Same-time downscaling maps forcings(t) -> output(t), so every valid
+        date needs its own low-res input (re-read from the source dataset) and
+        its own date-dependent computed forcings (insolation, Julian day, ...).
+        Mirrors the input-building loop of :meth:`Runner.execute`; the computed
+        forcings are recomputed downstream by ``prepare_input_tensor``.
+
+        Parameters
+        ----------
+        date : datetime.datetime
+            The valid date to source the inputs for.
+
+        Returns
+        -------
+        dict[str, State]
+            One input state per dataset, keyed by dataset name. Output-only
+            datasets (sourced from the ``empty`` input) come back with empty
+            ``fields`` and checkpoint grid coordinates.
+        """
+        input_states: dict[str, State] = {}
+        for dataset in self.tensor_handlers:
+            prognostic_state = self.prognostics_inputs[dataset].create_input_state(date=date)
+            self._check_state(prognostic_state, "prognostics")
+
+            constants_state = self.constant_forcings_inputs[dataset].create_input_state(date=date)
+            self._check_state(constants_state, "constant_forcings")
+
+            forcings_state = self.dynamic_forcings_inputs[dataset].create_input_state(date=date)
+            self._check_state(forcings_state, "dynamic_forcings")
+
+            input_states[dataset] = self._combine_states(prognostic_state, constants_state, forcings_state)
+            self._ensure_grid_coordinates(input_states[dataset], dataset)
+        return input_states
+
     def predict_step(
         self,
         model: "torch.nn.Module",
@@ -123,58 +195,45 @@ class DiffusionDownscalingRunner(DownscalingRunner):
             y_pred = {outputs[0]: y_pred}
         return y_pred
 
-
     def forecast(
         self,
         lead_time: str,
         input_tensors_numpy: dict[str, FloatArray],
         input_states: dict[str, State],
     ) -> Generator[dict[str, State], None, None]:
-        """Forecast with an ensemble loop over ``num_members`` noise draws.
+        """Sweep every valid date in ``[start, start + lead_time]``.
 
-        For each valid date the model is called ``num_members`` times.
-        Each call draws fresh Gaussian noise inside
-        ``AnemoiD2ModelEncProcDec.sample``, producing an independent sample.
-        States are yielded one per member, each carrying a ``"member"`` key.
+        Downscaling is same-time and NOT autoregressive: the input for each
+        valid date is independent. Every frame is therefore re-sourced (fresh
+        low-res field + recomputed date-dependent forcings) rather than reusing
+        the start date's tensors. For each date the model is sampled
+        ``num_members`` times, each a fresh noise draw.
 
         Parameters
         ----------
         lead_time : str
             Lead time string (e.g. ``"6h"``), forwarded to the stepper.
         input_tensors_numpy : dict[str, FloatArray]
-            Input tensors per dataset, numpy arrays with shape
-            ``(multi_step_input, variables, grid_points)``.
+            Input tensors for the start date, as built by :meth:`Runner.run`.
+            Unused: every frame, the start date included, is rebuilt from
+            :meth:`_input_states_for_date` so they all share one code path.
         input_states : dict[str, State]
-            Input states per dataset, keyed by dataset name.
+            Input states for the start date, keyed by dataset name. Only the
+            ``"date"`` entry is read, to seed the stepper.
 
         Yields
         ------
         dict[str, State]
-            One state dict per ensemble member per valid date.
-            Each state carries ``"date"``, ``"step"``, ``"member"``, and
-            ``"fields"`` (a mapping from variable name to 1-D numpy array).
+            One state dict per ensemble member per valid date. Each state
+            carries ``"date"``, ``"step"``, ``"member"``, and ``"fields"``
+            (a mapping from variable name to 1-D numpy array).
         """
         with torch.inference_mode():
             self.model.eval()
 
-            # Build torch input tensors once: (time, vars, grid) → 4-D
-            # (batch, time, grid, vars). The ensemble axis is inserted per call in
-            # predict_step, keeping this 4-D form compatible with _print_input_tensor.
-            input_tensors_torch: dict[str, "torch.Tensor"] = {
-                ds: torch.from_numpy(np.swapaxes(t, -2, -1)[np.newaxis, ...]).to(self.device)
-                for ds, t in input_tensors_numpy.items()
-            }
-
             lead_time_td = to_timedelta(lead_time)
             start = next(iter(input_states.values()))["date"]
-
             LOG.info("Starting diffusion downscaling from %s", start)
-
-            if self.verbosity > 0:
-                for ds in input_tensors_torch:
-                    self.tensor_handlers[ds]._print_input_tensor(
-                        f"[{ds}] Input tensor", input_tensors_torch[ds]
-                    )
 
             hres_grid = self._hres_grid_metadata()
 
@@ -182,6 +241,31 @@ class DiffusionDownscalingRunner(DownscalingRunner):
                 self.forecast_stepper(start, lead_time_td)
             ):
                 valid_date: datetime.datetime = dates[0]
+
+                # --- re-source inputs for THIS valid date ------------------
+                # Every frame goes through the same path, the start date
+                # included, so frame 0 can never drift from the rest.
+                frame_states = self._input_states_for_date(valid_date)
+
+                with self._quiet_tensor_logs(s):
+                    tensors_numpy = {
+                        ds: handler.prepare_input_tensor(frame_states[ds])
+                        for ds, handler in self.tensor_handlers.items()
+                        if frame_states[ds].get("fields")  # skip output-only datasets (e.g. `empty`)
+                    }
+
+                # (time, vars, grid) → (batch, time, grid, vars); the ensemble
+                # axis is inserted later, in predict_step.
+                input_tensors_torch = {
+                    ds: torch.from_numpy(np.swapaxes(tensor, -2, -1)[np.newaxis, ...]).to(self.device)
+                    for ds, tensor in tensors_numpy.items()
+                }
+
+                if (s == 0 and self.verbosity > 0) or self.verbosity > 1:
+                    for ds in input_tensors_torch:
+                        self.tensor_handlers[ds]._print_input_tensor(
+                            f"[{ds}] Input tensor ({valid_date})", input_tensors_torch[ds]
+                        )
 
                 # ---- ensemble loop ----------------------------------------
                 for member in range(self.num_members):
@@ -204,8 +288,6 @@ class DiffusionDownscalingRunner(DownscalingRunner):
                         handler = self.tensor_handlers[ds]
                         tensor = y_pred[ds]
 
-                        # y_pred shape: (batch, [time], ensemble, grid, vars)
-                        # Normalise to 5-D by inserting a time dim if needed.
                         if tensor.ndim == 4:
                             tensor = tensor.unsqueeze(1)
 
@@ -213,15 +295,14 @@ class DiffusionDownscalingRunner(DownscalingRunner):
                             f"[{ds}] Expected 5-D output tensor, got {tensor.shape}"
                         )
 
-                        # Squeeze batch (0) and ensemble (2) → (time, grid, vars)
-                        output = torch.squeeze(tensor, dim=(0, 2))
+                        output = torch.squeeze(tensor, dim=(0, 2))  # (time, grid, vars)
 
-                        if self.verbosity > 0:
+                        if (s == 0 and self.verbosity > 0) or self.verbosity > 1:
                             handler._print_output_tensor(
                                 f"[{ds}] Member {member}", output.cpu().numpy()
                             )
 
-                        state: State = {k: v for k, v in input_states[ds].items()}
+                        state: State = dict(frame_states[ds])
                         state["fields"] = {
                             handler.metadata.output_tensor_index_to_variable[j]: output[0, :, j]
                             for j in range(output.shape[-1])
@@ -230,18 +311,12 @@ class DiffusionDownscalingRunner(DownscalingRunner):
                         state["step"] = step
                         state["member"] = member
 
-                        # Two-grid (Option B): inject hres coordinates when available.
                         if hres_grid is not None:
                             state["latitudes"], state["longitudes"] = hres_grid
 
                         new_states[ds] = state
 
                     yield new_states
-
-                # Same-time downscaling: input tensors do not change between
-                # members or between timesteps — no tensor update needed here.
-                # (Dynamic ERA5 inputs for the next timestep are fetched from
-                # the Zarr at the start of the next execute() step.)
 
                 if is_last:
                     break
