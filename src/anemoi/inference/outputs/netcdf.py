@@ -51,6 +51,9 @@ class NetCDFOutput(Output):
         write_initial_state: bool | None = None,
         float_size: str = "f4",
         missing_value: float | None = np.nan,
+        zlib: bool = False,
+        complevel: int = 4,
+        shuffle: bool = True,
     ) -> None:
         """Initialise the NetCDF output object.
 
@@ -73,6 +76,15 @@ class NetCDFOutput(Output):
             The size of the float, by default "f4".
         missing_value : float, optional
             The missing value, by default np.nan.
+        zlib : bool, optional
+            Whether to zlib-compress the variables, by default False.
+            When False, `complevel` and `shuffle` are ignored.
+        complevel : int, optional
+            zlib compression level, 1 (fastest) to 9 (smallest), by default 4.
+        shuffle : bool, optional
+            Whether to apply the HDF5 shuffle filter, by default True.
+            It reorders bytes before deflating, which usually improves the
+            ratio on float data at negligible cost.
         """
 
         super().__init__(
@@ -90,6 +102,7 @@ class NetCDFOutput(Output):
         self.ncfile: Dataset | None = None
         self.float_size = float_size
         self.missing_value = missing_value
+        self.compression = dict(zlib=zlib, complevel=complevel, shuffle=shuffle) if zlib else {}
 
     def __repr__(self) -> str:
         """Return a string representation of the NetCDFOutput object."""
@@ -118,7 +131,7 @@ class NetCDFOutput(Output):
 
         state = self.post_process(state)
 
-        compression = {}  # dict(zlib=False, complevel=0)
+        compression = self.compression
 
         values = len(state["latitudes"])
         self.reference_date = state["date"]
@@ -181,7 +194,7 @@ class NetCDFOutput(Output):
 
         values = len(state["latitudes"])
 
-        compression = {}  # dict(zlib=False, complevel=0)
+        compression = self.compression
 
         for name in state["fields"].keys():
             if self.skip_variable(name):
