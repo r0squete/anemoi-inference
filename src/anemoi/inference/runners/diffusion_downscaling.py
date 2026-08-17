@@ -10,7 +10,6 @@
 import datetime
 import logging
 from collections.abc import Generator
-from contextlib import contextmanager
 
 import numpy as np
 from anemoi.utils.dates import frequency_to_timedelta as to_timedelta
@@ -19,7 +18,6 @@ from anemoi.utils.timer import Timer
 from anemoi.inference.config.run import RunConfiguration
 from anemoi.inference.lazy import torch
 from anemoi.inference.profiler import ProfilingLabel
-from anemoi.inference.tensors import TensorHandler
 from anemoi.inference.types import FloatArray
 from anemoi.inference.types import State
 
@@ -27,9 +25,6 @@ from . import runner_registry
 from .downscaling import DownscalingRunner
 
 LOG = logging.getLogger(__name__)
-
-# Logger of the tensor handlers, muted while re-sourcing frames (see `_quiet_tensor_logs`).
-TENSORS_LOG = logging.getLogger(TensorHandler.__module__)
 
 
 @runner_registry.register("diffusion_downscaling")
@@ -103,37 +98,6 @@ class DiffusionDownscalingRunner(DownscalingRunner):
     # ------------------------------------------------------------------
     # Core inference — ensemble loop
     # ------------------------------------------------------------------
-    @contextmanager
-    def _quiet_tensor_logs(self, step_index: int) -> Generator[None, None, None]:
-        """Mute the tensor handlers' INFO chatter after the first frame.
-
-        ``prepare_input_tensor`` re-emits the whole "Initial forcings
-        providers" block and the tensor shape on every call. That is
-        informative for the first frame and pure noise for the remaining
-        ``lead_time // timestep`` ones. Warnings and above still pass through,
-        and ``verbosity > 1`` keeps every message.
-
-        Parameters
-        ----------
-        step_index : int
-            Index of the frame being sourced. Frame 0 is left untouched.
-
-        Yields
-        ------
-        None
-            With :data:`TENSORS_LOG` muted for the duration of the block.
-        """
-        if step_index == 0 or self.verbosity > 1:
-            yield
-            return
-
-        previous = TENSORS_LOG.level
-        TENSORS_LOG.setLevel(max(previous, logging.WARNING))
-        try:
-            yield
-        finally:
-            TENSORS_LOG.setLevel(previous)
-
     def _input_states_for_date(self, date: datetime.datetime) -> dict[str, State]:
         """Build a fresh input state per dataset for ``date``.
 
@@ -247,12 +211,11 @@ class DiffusionDownscalingRunner(DownscalingRunner):
                 # included, so frame 0 can never drift from the rest.
                 frame_states = self._input_states_for_date(valid_date)
 
-                with self._quiet_tensor_logs(s):
-                    tensors_numpy = {
-                        ds: handler.prepare_input_tensor(frame_states[ds])
-                        for ds, handler in self.tensor_handlers.items()
-                        if frame_states[ds].get("fields")  # skip output-only datasets (e.g. `empty`)
-                    }
+                tensors_numpy = {
+                    ds: handler.prepare_input_tensor(frame_states[ds])
+                    for ds, handler in self.tensor_handlers.items()
+                    if frame_states[ds].get("fields")  # skip output-only datasets (e.g. `empty`)
+                }
 
                 # (time, vars, grid) → (batch, time, grid, vars); the ensemble
                 # axis is inserted later, in predict_step.
@@ -261,7 +224,7 @@ class DiffusionDownscalingRunner(DownscalingRunner):
                     for ds, tensor in tensors_numpy.items()
                 }
 
-                if (s == 0 and self.verbosity > 0) or self.verbosity > 1:
+                if self.verbosity > 0:
                     for ds in input_tensors_torch:
                         self.tensor_handlers[ds]._print_input_tensor(
                             f"[{ds}] Input tensor ({valid_date})", input_tensors_torch[ds]
@@ -297,7 +260,7 @@ class DiffusionDownscalingRunner(DownscalingRunner):
 
                         output = torch.squeeze(tensor, dim=(0, 2))  # (time, grid, vars)
 
-                        if (s == 0 and self.verbosity > 0) or self.verbosity > 1:
+                        if self.verbosity > 0:
                             handler._print_output_tensor(
                                 f"[{ds}] Member {member}", output.cpu().numpy()
                             )
