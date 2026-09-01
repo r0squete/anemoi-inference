@@ -56,7 +56,7 @@ optional-dependencies.all = [
   "anemoi-utils[all]>=0.4.32",
 ]
 optional-dependencies.cosmo = [
-  "eccodes<=2.39.1",
+  "eccodes<=2.48.0",
   "eccodes-cosmo-resources-python",
 ]
 optional-dependencies.dev = [ "anemoi-inference[all,docs,tests]" ]
